@@ -1,0 +1,16 @@
+[package]
+name = "oms_bridge"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "oms_bridge"
+
+[dependencies]
+rcal = { workspace = true }
+rcal_macros = { workspace = true }
+tokio = { workspace = true }
+slog = { workspace = true }
+slog-term = { workspace = true }
+slog-async = { workspace = true }
+chrono = { workspace = true }

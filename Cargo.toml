@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["oms_bridge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+rcal = { version = "3.0.0", features = ["service"] }
+rcal_macros = { version = "3.0.0" }
+tokio = { version = "1", features = ["full"] }
+slog = "2"
+slog-term = "2"
+slog-async = "2"
+chrono = "0.4"

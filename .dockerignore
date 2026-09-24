@@ -1,0 +1,6 @@
+target/
+.git/
+.claude/
+*.stackdump
+.env*
+CALConfig.toml*
