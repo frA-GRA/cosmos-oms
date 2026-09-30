@@ -1,31 +1,37 @@
 # syntax=docker/dockerfile:1
+ARG OPENC3_TAG=7.4.0
+
+# Stage 1: build static oms_bridge binary (musl, no shared libs)
 FROM rust:alpine AS builder
 
 RUN apk add --no-cache musl-dev
-
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /build
 
-# Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY oms_bridge/Cargo.toml ./oms_bridge/
-
-# Fetch dependencies before copying source (cache layer)
+COPY config/CALConfig.toml ./config/
 COPY .cargo ./.cargo
-RUN cargo fetch --locked
+COPY build.rs ./
+COPY src ./src
+COPY local_deps ./local_deps
+COPY vendor ./vendor
+RUN cargo build --release --frozen --offline --target x86_64-unknown-linux-musl -p oms_bridge
 
-# Copy source and build
-COPY oms_bridge/src ./oms_bridge/src
+# Stage 2: build the cosmos plugin gem
+FROM ruby:3-alpine AS gem-builder
 
-RUN RCAL_XSD_PATH=$(find "$CARGO_HOME" -name 'UCI_Minimal_v2_5_0.xsd' -print -quit) \
-    cargo build --release --locked --target x86_64-unknown-linux-musl -p oms_bridge
+WORKDIR /plugin
+COPY cosmos-oms.gemspec plugin.txt ./
+COPY microservices ./microservices
+# Pull the generated telemetry definitions from the Rust build so the gem is
+# correct even without a prior local `cargo build`.
+COPY --from=builder /build/targets/OMS/cmd_tlm/oms_generated.txt ./targets/OMS/cmd_tlm/
+RUN gem build cosmos-oms.gemspec
 
-FROM scratch
-COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/oms_bridge /oms_bridge
-COPY plugin.txt /plugin.txt
-COPY targets /targets
-COPY microservices /microservices
+# Stage 3: extend the standard operator image with the binary and gem
+FROM openc3inc/openc3-operator:${OPENC3_TAG}
 
-EXPOSE 7779
-ENTRYPOINT ["/oms_bridge"]
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/oms_bridge /usr/local/bin/oms_bridge
+COPY --from=gem-builder /plugin/cosmos-oms-1.0.0.gem /cosmos-oms.gem
+COPY plugin_instance.json /plugin_instance.json

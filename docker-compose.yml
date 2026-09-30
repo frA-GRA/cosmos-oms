@@ -1,0 +1,78 @@
+# Full COSMOS + OMS bridge stack.
+#
+# Requires a cosmos-project checkout. Set COSMOS_PROJECT_DIR to its path
+# (defaults to ../cosmos-project). Run: docker compose up -d
+#
+# Requires Docker Compose >= 2.23 (Docker Desktop 4.25+).
+
+include:
+  - path: ${COSMOS_PROJECT_DIR:-../cosmos-project}/compose.yaml
+    env_file: ${COSMOS_PROJECT_DIR:-../cosmos-project}/.env
+
+services:
+  adsb-sim:
+    image: cosmos-oms/adsb-sim:latest
+    build:
+      context: ../rcal
+      dockerfile_inline: |
+        FROM rust:slim-bookworm AS builder
+        WORKDIR /build
+        COPY . .
+        WORKDIR /build/adsb_sim
+        RUN cargo build --release --bin adsb_sim
+
+        FROM debian:bookworm-slim
+        WORKDIR /app
+        COPY --from=builder /build/adsb_sim/target/release/adsb_sim /app/adsb_sim
+        COPY --from=builder /build/adsb_sim/data/ /app/data/
+        ENV RCAL_CALCONFIG_PATH=/app/CALConfig.toml
+        CMD ["/app/adsb_sim"]
+    restart: unless-stopped
+    volumes:
+      - ./config/CALConfig.adsb_sim.toml:/app/CALConfig.toml:ro
+
+  asb-dump:
+    image: cosmos-oms/asb-dump:latest
+    build:
+      context: ../rcal
+      dockerfile_inline: |
+        FROM rust:slim-bookworm AS builder
+        WORKDIR /build
+        COPY . .
+        WORKDIR /build/rcal
+        RUN cargo build --release --bin asb_dump
+
+        FROM debian:bookworm-slim
+        WORKDIR /app
+        COPY --from=builder /build/rcal/target/release/asb_dump /app/asb_dump
+        ENV RCAL_CALCONFIG_PATH=/app/CALConfig.toml
+        CMD ["/app/asb_dump", "/dumps/asb_dump.xml"]
+    restart: unless-stopped
+    volumes:
+      - ./config/CALConfig.asb_dump.toml:/app/CALConfig.toml:ro
+      - ./dumps:/dumps
+
+  # Override the standard operator with our image so OMS_BRIDGE can run oms_bridge binary
+  openc3-operator:
+    image: cosmos-oms:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENC3_TAG: ${OPENC3_TAG:-7.4.0}
+    volumes:
+      - "${OMS_CONFIG_DIR:-./config}:/config:ro"
+
+  # Installs the plugin gem and metadata into the cosmos-project plugins directory
+  install-plugin:
+    image: cosmos-oms:latest
+    depends_on:
+      openc3-operator:
+        condition: service_started
+    volumes:
+      - "${COSMOS_PROJECT_DIR:-../cosmos-project}/plugins/DEFAULT/cosmos-oms:/install"
+    entrypoint: >
+      sh -c "mkdir -p /install &&
+             cp /cosmos-oms.gem /install/cosmos-oms-1.0.0.gem &&
+             cp /plugin_instance.json /install/plugin_instance.json"
+    restart: "no"

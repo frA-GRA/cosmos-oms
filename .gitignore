@@ -5,3 +5,8 @@ skills-lock.json
 .claude/settings.local.json
 .claude/skills
 **/target/
+config/
+dumps/
+local_deps/
+vendor/
+targets/

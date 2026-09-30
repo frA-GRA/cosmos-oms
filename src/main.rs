@@ -6,9 +6,7 @@ use std::sync::Arc;
 use slog::error;
 
 use rcal::cal;
-use rcal::cal::TopicQos;
 use rcal::service::{AbstractService, AbstractServiceImpl};
-use rcal::uci::types::{ServiceStatus_, SubsystemStatus_, SystemStatus_};
 
 #[rcal_macros::rcal_main]
 async fn main() {
@@ -21,7 +19,10 @@ async fn main() {
 
     let (tx, _) = tokio::sync::broadcast::channel::<Arc<Vec<u8>>>(256);
 
-    bridge::start(port, tx.clone(), root_logger.clone()).await;
+    if let Err(e) = bridge::start(port, tx.clone(), root_logger.clone()).await {
+        error!(root_logger, "TCP bind failed"; "port" => port, "error" => %e);
+        std::process::exit(1);
+    }
 
     let mut cal = match cal::get_cal(
         "oms_ingest",
@@ -57,39 +58,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let tx1 = tx.clone();
-    if let Err(e) =
-        svc.create_reader::<SystemStatus_, _>("SystemStatus", TopicQos::default(), move |msg, _| {
-            let pkt = codec::encode_system_status(msg);
-            let _ = tx1.send(Arc::new(pkt));
-        })
-    {
-        error!(root_logger, "SystemStatus reader failed"; "error" => %e);
-    }
-
-    let tx2 = tx.clone();
-    if let Err(e) = svc.create_reader::<ServiceStatus_, _>(
-        "ServiceStatus",
-        TopicQos::default(),
-        move |msg, _| {
-            let pkt = codec::encode_service_status(msg);
-            let _ = tx2.send(Arc::new(pkt));
-        },
-    ) {
-        error!(root_logger, "ServiceStatus reader failed"; "error" => %e);
-    }
-
-    let tx3 = tx.clone();
-    if let Err(e) = svc.create_reader::<SubsystemStatus_, _>(
-        "SubsystemStatus",
-        TopicQos::default(),
-        move |msg, _| {
-            let pkt = codec::encode_subsystem_status(msg);
-            let _ = tx3.send(Arc::new(pkt));
-        },
-    ) {
-        error!(root_logger, "SubsystemStatus reader failed"; "error" => %e);
-    }
+    include!(concat!(env!("OUT_DIR"), "/subscribers.rs"));
 
     tokio::signal::ctrl_c().await.ok();
 

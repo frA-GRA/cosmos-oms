@@ -7,12 +7,16 @@ use tokio::sync::broadcast;
 
 pub type PacketTx = broadcast::Sender<Arc<Vec<u8>>>;
 
-pub async fn start(port: u16, tx: PacketTx, logger: slog::Logger) -> tokio::task::JoinHandle<()> {
+pub async fn start(
+    port: u16,
+    tx: PacketTx,
+    logger: slog::Logger,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().expect("valid addr");
-    let listener = TcpListener::bind(addr).await.expect("TCP bind failed");
+    let listener = TcpListener::bind(addr).await?;
     info!(logger, "OMS bridge listening"; "port" => port);
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -45,5 +49,5 @@ pub async fn start(port: u16, tx: PacketTx, logger: slog::Logger) -> tokio::task
                 }
             }
         }
-    })
+    }))
 }

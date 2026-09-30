@@ -1,0 +1,9 @@
+{
+  "name": "cosmos-oms-1.0.0.gem",
+  "variables": {
+    "oms_bridge_binary": "/usr/local/bin/oms_bridge",
+    "oms_calconfig_path": "/config/CALConfig.toml",
+    "oms_bridge_port": "7779",
+    "oms_zmq_peer": ""
+  }
+}

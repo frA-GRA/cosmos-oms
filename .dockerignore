@@ -3,4 +3,4 @@ target/
 .claude/
 *.stackdump
 .env*
-CALConfig.toml*
+plugins/
