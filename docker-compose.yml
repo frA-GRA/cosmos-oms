@@ -1,4 +1,4 @@
-# Full COSMOS + OMS bridge stack.
+# COSMOS + OMS bridge stack — no demo plugin.
 #
 # Requires a cosmos-project checkout. Set COSMOS_PROJECT_DIR to its path
 # (defaults to ../cosmos-project). Run: docker compose up -d
@@ -30,6 +30,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./config/CALConfig.adsb_sim.toml:/app/CALConfig.toml:ro
+    networks:
+      - default
+      - cosmos-project_default
 
   asb-dump:
     image: cosmos-oms/asb-dump:latest
@@ -52,6 +55,14 @@ services:
       - ./config/CALConfig.asb_dump.toml:/app/CALConfig.toml:ro
       - ./dumps:/dumps
 
+  # Suppress demo plugin; wait for install-plugin so the gem is present before init scans ./plugins.
+  openc3-cosmos-init:
+    environment:
+      OPENC3_DEMO: ""
+    depends_on:
+      install-plugin:
+        condition: service_completed_successfully
+
   # Override the standard operator with our image so OMS_BRIDGE can run oms_bridge binary
   openc3-operator:
     image: cosmos-oms:latest
@@ -63,12 +74,10 @@ services:
     volumes:
       - "${OMS_CONFIG_DIR:-./config}:/config:ro"
 
-  # Installs the plugin gem and metadata into the cosmos-project plugins directory
+  # Installs the plugin gem and metadata into the cosmos-project plugins directory.
+  # Runs before openc3-cosmos-init so the gem is present when init scans ./plugins.
   install-plugin:
     image: cosmos-oms:latest
-    depends_on:
-      openc3-operator:
-        condition: service_started
     volumes:
       - "${COSMOS_PROJECT_DIR:-../cosmos-project}/plugins/DEFAULT/cosmos-oms:/install"
     entrypoint: >
@@ -76,3 +85,8 @@ services:
              cp /cosmos-oms.gem /install/cosmos-oms-1.0.0.gem &&
              cp /plugin_instance.json /install/plugin_instance.json"
     restart: "no"
+
+networks:
+  cosmos-project_default:
+    external: true
+    name: cosmos-project_default
