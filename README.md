@@ -1,133 +1,277 @@
 # cosmos-oms
 
-An [OpenC3](https://openc3.com) plugin that bridges OMS UCI messages into a cosmos deployment. The plugin consists of a Rust microservice binary (`oms_bridge`) that connects to an OMS ASB bus, receives UCI messages, and re-publishes them as cosmos telemetry packets over TCP. The `OMS` target defines the telemetry structure; the microservice and interface are wired up via `plugin.txt`.
+OpenC3 COSMOS plugin that bridges OMS UCI messages into COSMOS telemetry over DDS.
 
-## Quickstart
- 1. `docker compose up -d`
- 2. Go to the [OpenC3 Console](http://127.0.0.1:2900). You may need to wait a couple of minutes for the system to come up.
- 3.
+The Rust binary (`oms_bridge`) subscribes to OMS UCI topics via `rcal`, encodes each
+status message into a COSMOS-compatible binary packet, and forwards it to COSMOS over
+a local TCP socket.  Telemetry definitions are generated at build time from the UCI XSD
+so the COSMOS packet layout always matches the wire types.
 
-## Configuration
+---
 
-### Field mapping
+## Repository layout
 
-By default the bridge auto-detects fields from every UCI message using XSD heuristics. To control exactly which fields appear as COSMOS telemetry items — and how they are typed — create `config/oms_field_mappings.toml`:
-
-```toml
-[[message]]
-name = "SystemStatus"           # UCI element name (matches XSD element)
-
-[[message.field]]
-path = "MessageData/SystemId"   # slash-separated path from message root
-
-[[message.field]]
-path = "MessageData/SystemState"
-cosmos_name = "SYS_STATE"       # optional: override the COSMOS item name
-
-[[message.field]]
-path = "MessageData/TimeUp"
-type = "uint32"                 # optional: override auto-detected type
-cosmos_name = "UPTIME_SECONDS"
-
-[[message]]
-name = "ServiceStatus"
-
-[[message.field]]
-path = "MessageData/ServiceId"
-
-[[message.field]]
-path = "MessageData/ServiceState"
+```
+cosmos-oms/          ← this repo
+../cosmos-project/   ← OpenC3/COSMOS (sibling directory, or set COSMOS_PROJECT_DIR)
+../rcal/             ← rcal/rcal-macros crates (required for the Docker build)
 ```
 
-Field paths use PascalCase XSD element names. The `type` override accepts: `uint8`, `uint16`, `uint32`, `uint64`, `int8`, `int16`, `int32`, `int64`, `float32`, `float64`, `bool`, `uuid`, `enum`, `timestamp_ms`, `string:N` (N bytes). Auto-detection resolves the XSD type directly — explicit overrides are only needed when the inferred type is wrong for your use case.
-
-Messages not listed in the file fall back to heuristic detection (unchanged from the default behaviour).
-
-Point to an alternate file at runtime:
+Clone this repo next to `cosmos-project`:
 
 ```sh
-OMS_FIELD_MAPPINGS_PATH=/path/to/my_mappings.toml
-```
-
-Or set the plugin variable `oms_field_mappings_path` when installing via the Admin panel.
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `COSMOS_PROJECT_DIR` | `../cosmos-project` | Path to your cosmos-project checkout |
-| `OMS_CONFIG_DIR` | `./config` | Directory containing `CALConfig.toml` |
-| `OMS_BRIDGE_PORT` | `7779` | TCP port the bridge listens on (host-side, for debugging) |
-| `OMS_FIELD_MAPPINGS_PATH` | `config/oms_field_mappings.toml` | Path to the field mapping config |
-
-### Rebuilding after code changes
-
-```sh
-docker compose up --build openc3-operator
+cd <workspace>
+git clone https://github.com/OpenC3/cosmos cosmos-project   # if not already present
+git clone <this-repo-url> cosmos-oms
 ```
 
 ---
 
-## Manual install (existing COSMOS deployment)
+## Quick-start with Docker Compose
 
-Use this path if you already have a running COSMOS deployment and want to install the plugin without Docker.
+This spins up a full COSMOS stack plus the OMS bridge in one command.
 
 ### Prerequisites
 
-- A running [OpenC3 COSMOS](https://docs.openc3.com/docs/getting-started/installation) deployment
-- An OMS system publishing UCI messages over DDS/ASB
+- Docker Desktop 4.25+ (Compose v2.23+)
+- `cosmos-project` checked out at `../cosmos-project` (or set `COSMOS_PROJECT_DIR`)
+- `rcal` crate sources at `../rcal` (required to build `adsb-sim` / `asb-dump`)
 
-### 1. Build the binary
+### Start everything
 
 ```sh
-cargo build --release --locked
+docker compose up -d
 ```
 
-### 2. Configure
+COSMOS will be available at <http://localhost:2900> (password: `12345678`).
 
-Edit `CALConfig.toml` — at minimum set the DDS transport URI and a unique system ID:
+To point at a cosmos-project in a different location:
+
+```sh
+COSMOS_PROJECT_DIR=/path/to/cosmos-project docker compose up -d
+```
+
+or export it in your shell:
+
+```sh
+export COSMOS_PROJECT_DIR=/path/to/cosmos-project
+docker compose up -d
+```
+
+### Configuration
+
+| File | Purpose |
+|---|---|
+| `config/CALConfig.toml` | rcal transport and subscribed UCI topics |
+| `config/oms_field_mappings.toml` | Which XSD fields to expose as COSMOS items |
+
+Mount overrides are picked up automatically — see `docker-compose.yml` (`OMS_CONFIG_DIR`).
+
+### Stop / tear down
+
+```sh
+docker compose down
+```
+
+---
+
+## Installing into an existing COSMOS instance
+
+Use this path when COSMOS is already running (started via `openc3.bat start` /
+`openc3.sh start`) and you only want to add the OMS plugin.
+
+### 1. Build the gem
+
+Requires Rust (stable), Ruby, and the `rcal` crate at `../rcal/rcal`.
+
+```sh
+# Generate telemetry definitions and the oms_bridge binary
+cargo build --release
+
+# Package the gem (picks up targets/OMS/cmd_tlm/oms_generated.txt from the build)
+gem build cosmos-oms.gemspec
+```
+
+This produces `cosmos-oms-1.0.0.gem`.
+
+### 2. Load the plugin
+
+```sh
+# Windows
+..\cosmos-project\openc3.bat cli load cosmos-oms-1.0.0.gem
+
+# Linux / macOS
+../cosmos-project/openc3.sh cli load cosmos-oms-1.0.0.gem
+```
+
+COSMOS will prompt for plugin variables (ports, config paths, etc.).
+The defaults in `plugin_instance.json` work out of the box for a local install.
+
+### 3. Verify
+
+```sh
+# Windows
+..\cosmos-project\openc3.bat
+
+# Linux / macOS
+../cosmos-project/openc3.sh
+```
+
+Then check <http://localhost:2900> — the `OMS` target should appear in CmdTlmServer.
+
+### Unload
+
+```sh
+# Windows
+..\cosmos-project\openc3.bat cli unload cosmos-oms-1.0.0.gem__0
+
+# Linux / macOS
+../cosmos-project/openc3.sh cli unload cosmos-oms-1.0.0.gem__0
+```
+
+---
+
+## Connecting `oms_bridge` to DDS
+
+`oms_bridge` uses rcal's DDS transport.  The DDS domain participant must be able to
+discover OMS peers.
+
+### From another Docker container (e.g. `adsb-sim`)
+
+The `docker-compose.yml` attaches all services to the `cosmos-project_default` network.
+Any container on that network can reach the DDS domain.  No extra configuration is
+needed — rcal defaults to DDS domain 0 via the `uri = "0"` setting in `CALConfig.toml`.
+
+If your OMS source container is on a different Compose project, attach it to the same
+network:
+
+```yaml
+# in your other compose file
+services:
+  your-oms-source:
+    networks:
+      - cosmos-project_default
+
+networks:
+  cosmos-project_default:
+    external: true
+    name: cosmos-project_default
+```
+
+### From the host machine
+
+Docker's default bridge network does **not** route multicast, which DDS relies on for
+peer discovery.  To bridge DDS between host and container use one of:
+
+**Option A — host network mode (Linux only)**
+
+```yaml
+services:
+  openc3-operator:
+    network_mode: host
+```
+
+**Option B — set a unicast peer address**
+
+Set `OMS_ZMQ_PEER` (or `RCAL_INITIAL_PEERS`) to the host's IP in `plugin.txt` /
+`plugin_instance.json`, or pass it as an environment variable:
 
 ```toml
-[system]
-id = "my-cosmos-oms-bridge"
-
-[[transport]]
-id = "oms-bus"
-type = "dds"
-uri = "udp://239.255.0.1:7400"
+# config/CALConfig.toml — add under [[transport]]
+initial_peers = ["<host-ip>"]
 ```
 
-This file must be accessible inside the cosmos microservice container at runtime. Mount it into the container or place it on a shared volume.
+**Option C — run `oms_bridge` directly on the host**
 
-### 3. Install the binary
-
-The cosmos microservice container runs the Ruby launcher (`microservices/oms_bridge_microservice.rb`), which spawns the `oms_bridge` binary as a subprocess. Install the binary somewhere the microservice container can access it:
+Build with the native target instead of musl and run the binary outside Docker.
+It will share the host DDS domain with other processes automatically:
 
 ```sh
-install -m 755 target/release/oms_bridge /path/on/cosmos-host/oms_bridge
+cargo build --release
+RCAL_CALCONFIG_PATH=config/CALConfig.toml ./target/release/oms_bridge
 ```
 
-### 4. Install the plugin in OpenC3
+Then point the COSMOS interface at `127.0.0.1:7780`.
 
-Upload the plugin via the **Admin** panel → **Plugins** → **Install**, selecting `plugin.txt` and the `targets/` and `microservices/` directories. Set the plugin variables when prompted:
+---
 
-| Variable | Description | Default |
-|---|---|---|
-| `oms_bridge_binary` | Full path to `oms_bridge` inside the microservice container | `oms_bridge` |
-| `oms_calconfig_path` | Path to `CALConfig.toml` inside the microservice container | `CALConfig.toml` |
-| `oms_field_mappings_path` | Path to field mapping TOML inside the microservice container | `/config/oms_field_mappings.toml` |
-| `oms_bridge_port` | TCP port the bridge listens on | `7779` |
+## Adding telemetry translations
 
-Alternatively, use the OpenC3 CLI:
+Telemetry definitions are driven by two config files that are read at **build time**.
+After editing either file, rebuild (`cargo build --release` or `docker compose build`)
+to regenerate `targets/OMS/cmd_tlm/oms_generated.txt` and re-package the gem.
+
+### 1. Subscribe to a UCI topic — `config/CALConfig.toml`
+
+Add a `[[service.topic]]` entry under the relevant `[[service]]` block:
+
+```toml
+[[service]]
+id = "oms_ingest"
+
+[[service.topic]]
+id = "SystemStatus"
+
+[[service.topic]]
+id = "YourNewTopic"    # must match the XSD element name exactly
+```
+
+Topics listed here are the only ones the bridge subscribes to.  The build script
+cross-references this list against the UCI XSD to generate packet definitions.
+
+### 2. Select fields — `config/oms_field_mappings.toml`
+
+Each `[[message]]` block maps one UCI message type to COSMOS items.
+
+```toml
+[[message]]
+name = "YourNewTopic"          # XSD element name
+
+  [[message.field]]
+  path = "MessageData/SomeId"  # slash-separated XSD path from the message root
+
+  [[message.field]]
+  path = "MessageData/SomeGroup/SomeValue"
+  cosmos_name = "MY_ITEM"      # optional — defaults to UPPER_SNAKE of the leaf name
+  type = "float64"             # optional — overrides auto-detection
+```
+
+**Path rules:**
+- Use PascalCase names exactly as they appear in the XSD (e.g. `SystemId`, not `system_id`).
+- Slash-separate nested elements: `MessageData/Kinematics/Position/…`.
+
+**Type auto-detection** (no `type` key needed in most cases):
+
+| XSD type | COSMOS encoding |
+|---|---|
+| `*ID_Type` complexType | `STRING 288` (UUID) |
+| enum `simpleType` | `UINT 8` + `STATE` entries |
+| `xs:duration`-based | `UINT 32` (seconds) |
+| `xs:dateTime` / `xs:time` | `INT 64` (ms since Unix epoch) |
+| `xs:boolean` | `UINT 8` (`STATE FALSE/TRUE`) |
+| `xs:float` / `xs:double` | `FLOAT 32/64` |
+| `xs:unsignedInt` etc. | `UINT 8/16/32/64` |
+| `xs:string` / `xs:token` | `STRING 512` (64 bytes, zero-padded) |
+
+**Explicit `type` values:** `uint8`, `uint16`, `uint32`, `uint64`, `int8`, `int16`,
+`int32`, `int64`, `float32`, `float64`, `bool`, `uuid`, `enum`, `timestamp_ms`,
+`string:<N>` (N bytes).
+
+Messages not listed in `oms_field_mappings.toml` fall back to heuristic detection:
+UUID fields, `*State*` enum fields, and `TimeUp` duration are captured automatically.
+
+### 3. Rebuild and reinstall
 
 ```sh
-openc3.sh cli load cosmos-oms-plugin.gem
+cargo build --release
+gem build cosmos-oms.gemspec
+..\cosmos-project\openc3.bat cli unload cosmos-oms-1.0.0.gem__0
+..\cosmos-project\openc3.bat cli load cosmos-oms-1.0.0.gem
 ```
 
-### 5. Verify telemetry
+Or with Docker Compose:
 
-Once the plugin is installed and the OMS source is active, open the OpenC3 **Telemetry Viewer** and select target `OMS`. The following packets should appear:
-
-- `SYSTEM_STATUS` — overall system state
-- `SERVICE_STATUS` — per-service state and uptime
-- `SUBSYSTEM_STATUS` — per-subsystem operational state
+```sh
+docker compose build openc3-operator
+docker compose up -d
+```
