@@ -3,6 +3,9 @@
 // Reads the UCI XSD to discover enabled message types (filtered by RCAL_CALCONFIG_PATH),
 // then emits COSMOS telemetry definitions and Rust encode/subscribe code for each
 // enabled status message.
+//
+// Field selection is config-driven when config/oms_field_mappings.toml (or
+// OMS_FIELD_MAPPINGS_PATH) is present; otherwise heuristic fallback applies.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RCAL_XSD_PATH");
     println!("cargo:rerun-if-env-changed=RCAL_CALCONFIG_PATH");
     println!("cargo:rerun-if-env-changed=RCAL_CALCONFIG_SERVICES");
+    println!("cargo:rerun-if-env-changed=OMS_FIELD_MAPPINGS_PATH");
 
     let xsd_path = find_xsd();
     println!("cargo:rerun-if-changed={}", xsd_path.display());
@@ -23,7 +27,8 @@ fn main() {
 
     let schema = parse_xsd(&xsd_path);
     let enabled = enabled_elements();
-    let mut specs = build_specs(&schema, &enabled);
+    let mapping = load_mapping_config();
+    let mut specs = build_specs(&schema, &enabled, &mapping);
     specs.sort_by(|a, b| a.msg_name.cmp(&b.msg_name));
     for (i, spec) in specs.iter_mut().enumerate() {
         spec.packet_id = (i + 1) as u16;
@@ -64,9 +69,12 @@ fn find_xsd() -> PathBuf {
 // ─── XSD model ───────────────────────────────────────────────────────────────
 
 struct Schema {
-    elements: Vec<(String, String)>, // (element_name, type_local)
-    complex_types: HashMap<String, Vec<FieldInfo>>, // type_name → fields
-    simple_types: HashMap<String, Vec<String>>, // enum_name → XSD values in order
+    elements: Vec<(String, String)>,
+    complex_types: HashMap<String, Vec<FieldInfo>>,
+    /// Enum simpleTypes: type name → ordered XSD enumeration values.
+    simple_types: HashMap<String, Vec<String>>,
+    /// Non-enum simpleType restriction bases: type name → base type local name.
+    simple_type_bases: HashMap<String, String>,
 }
 
 struct FieldInfo {
@@ -85,12 +93,13 @@ fn parse_xsd(path: &PathBuf) -> Schema {
         elements: Vec::new(),
         complex_types: HashMap::new(),
         simple_types: HashMap::new(),
+        simple_type_bases: HashMap::new(),
     };
 
     let mut current_complex: Option<(String, Vec<FieldInfo>)> = None;
     let mut current_simple: Option<(String, Vec<String>)> = None;
+    let mut current_simple_base: Option<String> = None;
     let mut in_string_restriction = false;
-    // Deferred element — has annotation children, finalised on </element>
     let mut pending_element: Option<(String, String, u32, u32)> = None;
 
     loop {
@@ -111,22 +120,23 @@ fn parse_xsd(path: &PathBuf) -> Schema {
                         if current_simple.is_none() {
                             if let Some(name) = attr(e, "name") {
                                 current_simple = Some((name, Vec::new()));
+                                current_simple_base = None;
                                 in_string_restriction = false;
                             }
                         }
                     }
                     "restriction" => {
                         if current_simple.is_some() {
-                            let is_str = attr(e, "base")
-                                .map(|b| b.ends_with("string"))
-                                .unwrap_or(false);
-                            if is_str {
-                                in_string_restriction = true;
+                            if let Some(base) = attr(e, "base") {
+                                let base_local = local_part(&base);
+                                if base_local.ends_with("string") {
+                                    in_string_restriction = true;
+                                }
+                                current_simple_base = Some(base_local);
                             }
                         }
                     }
                     "enumeration" => {
-                        // value attribute is on the start tag regardless of empty/non-empty
                         if in_string_restriction {
                             if let (Some(st), Some(val)) = (&mut current_simple, attr(e, "value")) {
                                 st.1.push(val);
@@ -189,8 +199,11 @@ fn parse_xsd(path: &PathBuf) -> Schema {
                         if let Some((name, vals)) = current_simple.take() {
                             if !vals.is_empty() {
                                 schema.simple_types.insert(name, vals);
+                            } else if let Some(base) = current_simple_base.take() {
+                                schema.simple_type_bases.insert(name, base);
                             }
                         }
+                        current_simple_base = None;
                         in_string_restriction = false;
                     }
                     _ => {}
@@ -223,6 +236,136 @@ fn add_field(
         });
     } else if current_simple.is_none() {
         schema.elements.push((name, type_local));
+    }
+}
+
+// ─── Mapping config ───────────────────────────────────────────────────────────
+
+struct MappingConfig {
+    messages: Vec<MessageMapping>,
+}
+
+struct MessageMapping {
+    name: String,
+    fields: Vec<FieldMapping>,
+}
+
+struct FieldMapping {
+    path: String,
+    cosmos_name: Option<String>,
+    type_override: Option<String>,
+}
+
+fn load_mapping_config() -> Option<MappingConfig> {
+    let config_path = std::env::var("OMS_FIELD_MAPPINGS_PATH")
+        .ok()
+        .unwrap_or_else(|| "config/oms_field_mappings.toml".to_owned());
+    println!("cargo:rerun-if-changed={config_path}");
+
+    let content = std::fs::read_to_string(&config_path).ok()?;
+
+    let mut messages: Vec<MessageMapping> = Vec::new();
+    let mut cur_msg: Option<MessageMapping> = None;
+    let mut cur_field: Option<FieldMapping> = None;
+
+    #[derive(Default)]
+    enum Section {
+        #[default]
+        Other,
+        Message,
+        Field,
+    }
+    let mut section = Section::default();
+
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+
+        if t == "[[message]]" {
+            // flush current field into current message
+            if let (Some(f), Some(m)) = (cur_field.take(), cur_msg.as_mut()) {
+                if !f.path.is_empty() {
+                    m.fields.push(f);
+                }
+            }
+            // flush current message
+            if let Some(m) = cur_msg.take() {
+                if !m.name.is_empty() {
+                    messages.push(m);
+                }
+            }
+            cur_msg = Some(MessageMapping {
+                name: String::new(),
+                fields: Vec::new(),
+            });
+            section = Section::Message;
+            continue;
+        }
+        if t == "[[message.field]]" {
+            if let (Some(f), Some(m)) = (cur_field.take(), cur_msg.as_mut()) {
+                if !f.path.is_empty() {
+                    m.fields.push(f);
+                }
+            }
+            cur_field = Some(FieldMapping {
+                path: String::new(),
+                cosmos_name: None,
+                type_override: None,
+            });
+            section = Section::Field;
+            continue;
+        }
+        if t.starts_with("[[") {
+            if let (Some(f), Some(m)) = (cur_field.take(), cur_msg.as_mut()) {
+                if !f.path.is_empty() {
+                    m.fields.push(f);
+                }
+            }
+            section = Section::Other;
+            continue;
+        }
+
+        match section {
+            Section::Message => {
+                if let Some(v) = parse_toml_str(t, "name") {
+                    if let Some(m) = cur_msg.as_mut() {
+                        m.name = v;
+                    }
+                }
+            }
+            Section::Field => {
+                if let Some(f) = cur_field.as_mut() {
+                    if let Some(v) = parse_toml_str(t, "path") {
+                        f.path = v;
+                    } else if let Some(v) = parse_toml_str(t, "cosmos_name") {
+                        f.cosmos_name = Some(v);
+                    } else if let Some(v) = parse_toml_str(t, "type") {
+                        f.type_override = Some(v);
+                    }
+                }
+            }
+            Section::Other => {}
+        }
+    }
+
+    // flush last field + message
+    if let (Some(f), Some(m)) = (cur_field.take(), cur_msg.as_mut()) {
+        if !f.path.is_empty() {
+            m.fields.push(f);
+        }
+    }
+    if let Some(m) = cur_msg.take() {
+        if !m.name.is_empty() {
+            messages.push(m);
+        }
+    }
+
+    if messages.is_empty() {
+        None
+    } else {
+        Some(MappingConfig { messages })
     }
 }
 
@@ -358,7 +501,7 @@ fn parse_toml_str(line: &str, key: &str) -> Option<String> {
 // ─── Message spec ─────────────────────────────────────────────────────────────
 
 struct MessageSpec {
-    msg_name: String, // e.g. "SystemStatus"
+    msg_name: String,
     packet_id: u16,
     fields: Vec<FieldSpec>,
 }
@@ -378,9 +521,41 @@ enum FieldSpec {
         cosmos_name: String,
         accessor: String,
     },
+    UInt {
+        bits: u8,
+        cosmos_name: String,
+        accessor: String,
+    },
+    Int {
+        bits: u8,
+        cosmos_name: String,
+        accessor: String,
+    },
+    Float {
+        bits: u8,
+        cosmos_name: String,
+        accessor: String,
+    },
+    Bool {
+        cosmos_name: String,
+        accessor: String,
+    },
+    Str {
+        bytes: usize,
+        cosmos_name: String,
+        accessor: String,
+    },
+    TimestampMs {
+        cosmos_name: String,
+        accessor: String,
+    },
 }
 
-fn build_specs(schema: &Schema, enabled: &Option<HashSet<String>>) -> Vec<MessageSpec> {
+fn build_specs(
+    schema: &Schema,
+    enabled: &Option<HashSet<String>>,
+    mapping: &Option<MappingConfig>,
+) -> Vec<MessageSpec> {
     let mut specs = Vec::new();
 
     for (el_name, type_local) in &schema.elements {
@@ -403,45 +578,15 @@ fn build_specs(schema: &Schema, enabled: &Option<HashSet<String>>) -> Vec<Messag
             continue;
         };
 
-        let mut uuid_specs = Vec::new();
-        let mut state_specs = Vec::new();
-        let mut dur_specs = Vec::new();
+        let config_entry = mapping
+            .as_ref()
+            .and_then(|m| m.messages.iter().find(|mm| mm.name == *el_name));
 
-        for f in mdt_fields {
-            if f.min_occurs != 1 || f.max_occurs != 1 {
-                continue;
-            }
-            if f.type_local.ends_with("ID_Type") {
-                let upper = to_upper_snake(&f.name);
-                let cosmos_name = if upper.ends_with("_ID") {
-                    format!("{}_UUID", &upper[..upper.len() - 3])
-                } else {
-                    upper
-                };
-                uuid_specs.push(FieldSpec::Uuid {
-                    cosmos_name,
-                    accessor: snake(&f.name),
-                });
-            } else if f.name.contains("State") {
-                if let Some(variants) = schema.simple_types.get(&f.type_local) {
-                    state_specs.push(FieldSpec::State {
-                        cosmos_name: to_upper_snake(&f.name),
-                        accessor: snake(&f.name),
-                        enum_type: f.type_local.clone(),
-                        variants: variants.clone(),
-                    });
-                }
-            } else if f.name == "TimeUp" && f.type_local == "DurationType" {
-                dur_specs.push(FieldSpec::Duration {
-                    cosmos_name: "TIME_UP".to_owned(),
-                    accessor: "time_up".to_owned(),
-                });
-            }
-        }
-
-        let mut fields = uuid_specs;
-        fields.extend(state_specs);
-        fields.extend(dur_specs);
+        let fields = if let Some(entry) = config_entry {
+            build_fields_from_config(entry, type_local, schema)
+        } else {
+            build_fields_heuristic(mdt_fields, schema)
+        };
 
         if !fields.is_empty() {
             specs.push(MessageSpec {
@@ -453,6 +598,362 @@ fn build_specs(schema: &Schema, enabled: &Option<HashSet<String>>) -> Vec<Messag
     }
 
     specs
+}
+
+fn build_fields_heuristic(mdt_fields: &[FieldInfo], schema: &Schema) -> Vec<FieldSpec> {
+    let mut uuid_specs = Vec::new();
+    let mut state_specs = Vec::new();
+    let mut dur_specs = Vec::new();
+
+    for f in mdt_fields {
+        if f.min_occurs != 1 || f.max_occurs != 1 {
+            continue;
+        }
+        let accessor = format!("msg.message_data().{}()", snake(&f.name));
+        if f.type_local.ends_with("ID_Type") {
+            let upper = to_upper_snake(&f.name);
+            let cosmos_name = if upper.ends_with("_ID") {
+                format!("{}_UUID", &upper[..upper.len() - 3])
+            } else {
+                upper
+            };
+            uuid_specs.push(FieldSpec::Uuid {
+                cosmos_name,
+                accessor,
+            });
+        } else if f.name.contains("State") {
+            if let Some(variants) = schema.simple_types.get(&f.type_local) {
+                state_specs.push(FieldSpec::State {
+                    cosmos_name: to_upper_snake(&f.name),
+                    accessor,
+                    enum_type: f.type_local.clone(),
+                    variants: variants.clone(),
+                });
+            }
+        } else if f.name == "TimeUp" && f.type_local == "DurationType" {
+            dur_specs.push(FieldSpec::Duration {
+                cosmos_name: "TIME_UP".to_owned(),
+                accessor,
+            });
+        }
+    }
+
+    let mut fields = uuid_specs;
+    fields.extend(state_specs);
+    fields.extend(dur_specs);
+    fields
+}
+
+fn build_fields_from_config(
+    entry: &MessageMapping,
+    mt_type: &str,
+    schema: &Schema,
+) -> Vec<FieldSpec> {
+    let mut fields = Vec::new();
+    for fm in &entry.fields {
+        let Some((xsd_type, accessor, min_occurs, max_occurs)) =
+            resolve_field_path(&fm.path, mt_type, schema)
+        else {
+            println!(
+                "cargo:warning=OMS mapping: path '{}' not found in XSD for message '{}'; skipping",
+                fm.path, entry.name
+            );
+            continue;
+        };
+        if min_occurs == 0 {
+            println!(
+                "cargo:warning=OMS mapping: path '{}' is optional (minOccurs=0); skipping",
+                fm.path
+            );
+            continue;
+        }
+        if max_occurs != 1 {
+            println!(
+                "cargo:warning=OMS mapping: path '{}' is repeated (maxOccurs!=1); skipping",
+                fm.path
+            );
+            continue;
+        }
+
+        let leaf = fm.path.split('/').next_back().unwrap_or(&fm.path);
+        let cosmos_name = fm
+            .cosmos_name
+            .clone()
+            .unwrap_or_else(|| to_upper_snake(leaf));
+
+        let spec = if let Some(ref type_str) = fm.type_override {
+            apply_type_override(type_str, cosmos_name, accessor, &xsd_type, schema)
+        } else {
+            match infer_field_spec(&xsd_type, cosmos_name.clone(), accessor, schema) {
+                Some(s) => Some(s),
+                None => {
+                    println!(
+                        "cargo:warning=OMS mapping: cannot auto-detect cosmos type for path '{}' \
+                         (XSD type '{xsd_type}'); add `type = \"...\"` override in oms_field_mappings.toml",
+                        fm.path
+                    );
+                    None
+                }
+            }
+        };
+
+        if let Some(s) = spec {
+            fields.push(s);
+        }
+    }
+    fields
+}
+
+/// Walk the XSD type graph following slash-separated path segments from the MT type root.
+/// Returns `(xsd_type_local, full_accessor_expr, min_occurs, max_occurs)` for the leaf field.
+fn resolve_field_path(
+    path: &str,
+    mt_type: &str,
+    schema: &Schema,
+) -> Option<(String, String, u32, u32)> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    let mut current_type = mt_type.to_owned();
+    let mut accessor = "msg".to_owned();
+    let mut leaf_xsd_type = String::new();
+    let mut min_occurs = 1u32;
+    let mut max_occurs = 1u32;
+
+    for seg in &segments {
+        let fields = schema.complex_types.get(&current_type)?;
+        let field = fields.iter().find(|f| f.name.as_str() == *seg)?;
+        accessor.push('.');
+        accessor.push_str(&snake(&field.name));
+        accessor.push_str("()");
+        leaf_xsd_type = field.type_local.clone();
+        min_occurs = field.min_occurs;
+        max_occurs = field.max_occurs;
+        current_type = field.type_local.clone();
+    }
+
+    if leaf_xsd_type.is_empty() {
+        return None;
+    }
+    Some((leaf_xsd_type, accessor, min_occurs, max_occurs))
+}
+
+/// Auto-detect a `FieldSpec` from an XSD type local name, resolving through simpleType bases.
+fn infer_field_spec(
+    xsd_type: &str,
+    cosmos_name: String,
+    accessor: String,
+    schema: &Schema,
+) -> Option<FieldSpec> {
+    // Enum simpleType
+    if let Some(variants) = schema.simple_types.get(xsd_type) {
+        return Some(FieldSpec::State {
+            cosmos_name,
+            accessor,
+            enum_type: xsd_type.to_owned(),
+            variants: variants.clone(),
+        });
+    }
+
+    // UUID complexType (e.g. SystemID_Type, RequestID_Type)
+    if xsd_type.ends_with("ID_Type") {
+        return Some(FieldSpec::Uuid {
+            cosmos_name,
+            accessor,
+        });
+    }
+
+    // Non-enum simpleType: resolve through restriction base
+    if let Some(base) = schema.simple_type_bases.get(xsd_type) {
+        let base = base.clone();
+        return infer_field_spec(&base, cosmos_name, accessor, schema);
+    }
+
+    // XSD primitive types (local names, namespace already stripped)
+    match xsd_type {
+        "duration" => Some(FieldSpec::Duration {
+            cosmos_name,
+            accessor,
+        }),
+        "dateTime" | "time" => Some(FieldSpec::TimestampMs {
+            cosmos_name,
+            accessor,
+        }),
+        "boolean" => Some(FieldSpec::Bool {
+            cosmos_name,
+            accessor,
+        }),
+        "unsignedByte" => Some(FieldSpec::UInt {
+            bits: 8,
+            cosmos_name,
+            accessor,
+        }),
+        "unsignedShort" => Some(FieldSpec::UInt {
+            bits: 16,
+            cosmos_name,
+            accessor,
+        }),
+        "unsignedInt" => Some(FieldSpec::UInt {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "unsignedLong" => Some(FieldSpec::UInt {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "byte" => Some(FieldSpec::Int {
+            bits: 8,
+            cosmos_name,
+            accessor,
+        }),
+        "short" => Some(FieldSpec::Int {
+            bits: 16,
+            cosmos_name,
+            accessor,
+        }),
+        "int" => Some(FieldSpec::Int {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "integer" | "long" => Some(FieldSpec::Int {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "float" => Some(FieldSpec::Float {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "double" => Some(FieldSpec::Float {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "string" | "token" | "normalizedString" | "anyURI" => Some(FieldSpec::Str {
+            bytes: 64,
+            cosmos_name,
+            accessor,
+        }),
+        _ => None,
+    }
+}
+
+/// Apply an explicit `type = "..."` override from the mapping config.
+fn apply_type_override(
+    type_str: &str,
+    cosmos_name: String,
+    accessor: String,
+    xsd_type: &str,
+    schema: &Schema,
+) -> Option<FieldSpec> {
+    match type_str {
+        "uint8" => Some(FieldSpec::UInt {
+            bits: 8,
+            cosmos_name,
+            accessor,
+        }),
+        "uint16" => Some(FieldSpec::UInt {
+            bits: 16,
+            cosmos_name,
+            accessor,
+        }),
+        "uint32" => Some(FieldSpec::UInt {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "uint64" => Some(FieldSpec::UInt {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "int8" => Some(FieldSpec::Int {
+            bits: 8,
+            cosmos_name,
+            accessor,
+        }),
+        "int16" => Some(FieldSpec::Int {
+            bits: 16,
+            cosmos_name,
+            accessor,
+        }),
+        "int32" => Some(FieldSpec::Int {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "int64" => Some(FieldSpec::Int {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "float32" => Some(FieldSpec::Float {
+            bits: 32,
+            cosmos_name,
+            accessor,
+        }),
+        "float64" => Some(FieldSpec::Float {
+            bits: 64,
+            cosmos_name,
+            accessor,
+        }),
+        "bool" => Some(FieldSpec::Bool {
+            cosmos_name,
+            accessor,
+        }),
+        "uuid" => Some(FieldSpec::Uuid {
+            cosmos_name,
+            accessor,
+        }),
+        "timestamp_ms" => Some(FieldSpec::TimestampMs {
+            cosmos_name,
+            accessor,
+        }),
+        "enum" => {
+            if let Some(variants) = schema.simple_types.get(xsd_type) {
+                Some(FieldSpec::State {
+                    cosmos_name,
+                    accessor,
+                    enum_type: xsd_type.to_owned(),
+                    variants: variants.clone(),
+                })
+            } else {
+                println!(
+                    "cargo:warning=OMS mapping: type='enum' for '{cosmos_name}' but \
+                     XSD type '{xsd_type}' has no enumeration; skipping"
+                );
+                None
+            }
+        }
+        _ if type_str.starts_with("string:") => {
+            if let Ok(n) = type_str["string:".len()..].parse::<usize>() {
+                Some(FieldSpec::Str {
+                    bytes: n,
+                    cosmos_name,
+                    accessor,
+                })
+            } else {
+                println!(
+                    "cargo:warning=OMS mapping: invalid string type '{type_str}' for \
+                     '{cosmos_name}'; expected string:<N>; skipping"
+                );
+                None
+            }
+        }
+        _ => {
+            println!(
+                "cargo:warning=OMS mapping: unknown type override '{type_str}' for \
+                 '{cosmos_name}'; skipping"
+            );
+            None
+        }
+    }
 }
 
 // ─── COSMOS config generator ──────────────────────────────────────────────────
@@ -469,6 +970,7 @@ fn generate_cosmos_config(specs: &[MessageSpec]) {
             spec.msg_name
         )
         .unwrap();
+        writeln!(out, "  APPEND_ITEM FRAME_LEN 32 UINT \"Frame length (protocol header)\"").unwrap();
         writeln!(
             out,
             "  APPEND_ID_ITEM PACKET_ID 16 UINT {} \"Packet type identifier\"",
@@ -510,6 +1012,39 @@ fn generate_cosmos_config(specs: &[MessageSpec]) {
                 FieldSpec::Duration { cosmos_name, .. } => {
                     writeln!(out, "  APPEND_ITEM {cosmos_name} 32 UINT \"Uptime\"").unwrap();
                     writeln!(out, "    UNITS Seconds s").unwrap();
+                }
+                FieldSpec::UInt {
+                    bits, cosmos_name, ..
+                } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} UINT \"\"").unwrap();
+                }
+                FieldSpec::Int {
+                    bits, cosmos_name, ..
+                } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} INT \"\"").unwrap();
+                }
+                FieldSpec::Float {
+                    bits, cosmos_name, ..
+                } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} FLOAT \"\"").unwrap();
+                }
+                FieldSpec::Bool { cosmos_name, .. } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} 8 UINT \"\"").unwrap();
+                    writeln!(out, "    STATE FALSE 0").unwrap();
+                    writeln!(out, "    STATE TRUE 1").unwrap();
+                }
+                FieldSpec::Str {
+                    bytes, cosmos_name, ..
+                } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} {} STRING \"\"", bytes * 8).unwrap();
+                }
+                FieldSpec::TimestampMs { cosmos_name, .. } => {
+                    writeln!(
+                        out,
+                        "  APPEND_ITEM {cosmos_name} 64 INT \"Timestamp (ms since Unix epoch)\""
+                    )
+                    .unwrap();
+                    writeln!(out, "    UNITS Milliseconds ms").unwrap();
                 }
             }
         }
@@ -585,7 +1120,7 @@ fn generate_codec(specs: &[MessageSpec], out_dir: &std::path::Path) {
     writeln!(out).unwrap();
 
     // State conversion functions (one per unique enum type)
-    let mut seen_state_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_state_fns: HashSet<String> = HashSet::new();
     for spec in specs {
         for field in &spec.fields {
             let FieldSpec::State {
@@ -662,44 +1197,7 @@ fn generate_codec(specs: &[MessageSpec], out_dir: &std::path::Path) {
         writeln!(out, "    let mut fields: Vec<u8> = Vec::new();").unwrap();
 
         for field in &spec.fields {
-            match field {
-                FieldSpec::Uuid { accessor, .. } => {
-                    writeln!(
-                        out,
-                        "    fields.extend_from_slice(&uuid_str(msg.message_data().{accessor}()));"
-                    )
-                    .unwrap();
-                }
-                FieldSpec::State {
-                    accessor,
-                    enum_type,
-                    ..
-                } => {
-                    let state_fn = format!("state_u8_{}", snake(enum_type));
-                    writeln!(
-                        out,
-                        "    fields.push({state_fn}(msg.message_data().{accessor}()));"
-                    )
-                    .unwrap();
-                }
-                FieldSpec::Duration { accessor, .. } => {
-                    writeln!(
-                        out,
-                        "    let time_up_ns: i64 = *msg.message_data().{accessor}();"
-                    )
-                    .unwrap();
-                    writeln!(
-                        out,
-                        "    let time_up_secs = u32::try_from(time_up_ns.max(0) / 1_000_000_000).unwrap_or(u32::MAX);"
-                    )
-                    .unwrap();
-                    writeln!(
-                        out,
-                        "    fields.extend_from_slice(&time_up_secs.to_be_bytes());"
-                    )
-                    .unwrap();
-                }
-            }
+            emit_field_encode(&mut out, field);
         }
 
         writeln!(out, "    frame({const_name}, ts_ms, &fields)").unwrap();
@@ -762,6 +1260,125 @@ fn generate_codec(specs: &[MessageSpec], out_dir: &std::path::Path) {
     writeln!(out, "}}").unwrap();
 
     std::fs::write(out_dir.join("codec.rs"), out).expect("write codec.rs");
+}
+
+fn emit_field_encode(out: &mut String, field: &FieldSpec) {
+    use std::fmt::Write as _;
+    match field {
+        FieldSpec::Uuid { accessor, .. } => {
+            writeln!(out, "    fields.extend_from_slice(&uuid_str({accessor}));").unwrap();
+        }
+        FieldSpec::State {
+            accessor,
+            enum_type,
+            ..
+        } => {
+            let state_fn = format!("state_u8_{}", snake(enum_type));
+            writeln!(out, "    fields.push({state_fn}({accessor}));").unwrap();
+        }
+        FieldSpec::Duration { accessor, .. } => {
+            writeln!(out, "    {{").unwrap();
+            writeln!(out, "        let dur_ns: i64 = *{accessor};").unwrap();
+            writeln!(
+                out,
+                "        let dur_secs = u32::try_from(dur_ns.max(0) / 1_000_000_000).unwrap_or(u32::MAX);"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        fields.extend_from_slice(&dur_secs.to_be_bytes());"
+            )
+            .unwrap();
+            writeln!(out, "    }}").unwrap();
+        }
+        FieldSpec::UInt { bits, accessor, .. } => match bits {
+            8 => writeln!(out, "    fields.push(*{accessor} as u8);").unwrap(),
+            16 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as u16).to_be_bytes());"
+            )
+            .unwrap(),
+            32 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as u32).to_be_bytes());"
+            )
+            .unwrap(),
+            64 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as u64).to_be_bytes());"
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        },
+        FieldSpec::Int { bits, accessor, .. } => match bits {
+            8 => writeln!(out, "    fields.push(*{accessor} as i8 as u8);").unwrap(),
+            16 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as i16).to_be_bytes());"
+            )
+            .unwrap(),
+            32 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as i32).to_be_bytes());"
+            )
+            .unwrap(),
+            64 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as i64).to_be_bytes());"
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        },
+        FieldSpec::Float { bits, accessor, .. } => match bits {
+            32 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as f32).to_be_bytes());"
+            )
+            .unwrap(),
+            64 => writeln!(
+                out,
+                "    fields.extend_from_slice(&(*{accessor} as f64).to_be_bytes());"
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        },
+        FieldSpec::Bool { accessor, .. } => {
+            writeln!(
+                out,
+                "    fields.push(if *{accessor} {{ 1u8 }} else {{ 0u8 }});"
+            )
+            .unwrap();
+        }
+        FieldSpec::Str {
+            bytes, accessor, ..
+        } => {
+            writeln!(out, "    {{").unwrap();
+            writeln!(out, "        let s_bytes = {accessor}.as_bytes();").unwrap();
+            writeln!(out, "        let mut s_buf = [0u8; {bytes}];").unwrap();
+            writeln!(
+                out,
+                "        s_buf[..s_bytes.len().min({bytes})].copy_from_slice(&s_bytes[..s_bytes.len().min({bytes})]);"
+            )
+            .unwrap();
+            writeln!(out, "        fields.extend_from_slice(&s_buf);").unwrap();
+            writeln!(out, "    }}").unwrap();
+        }
+        FieldSpec::TimestampMs { accessor, .. } => {
+            writeln!(out, "    {{").unwrap();
+            writeln!(out, "        let ts_dt: rcal::xs::DateTime = *{accessor};").unwrap();
+            writeln!(
+                out,
+                "        let ts_ms = chrono::DateTime::<chrono::Utc>::from(ts_dt).timestamp_millis();"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        fields.extend_from_slice(&ts_ms.to_be_bytes());"
+            )
+            .unwrap();
+            writeln!(out, "    }}").unwrap();
+        }
+    }
 }
 
 // ─── subscribers.rs generator ─────────────────────────────────────────────────

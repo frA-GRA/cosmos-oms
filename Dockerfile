@@ -15,8 +15,9 @@ COPY .cargo ./.cargo
 COPY build.rs ./
 COPY src ./src
 COPY local_deps ./local_deps
-COPY vendor ./vendor
-RUN cargo build --release --frozen --offline --target x86_64-unknown-linux-musl -p oms_bridge
+# Cargo.toml references rcal at ../rcal/rcal (i.e. /rcal/rcal from /build)
+RUN mkdir -p /rcal && ln -s /build/local_deps/rcal /rcal/rcal
+RUN cargo build --release --target x86_64-unknown-linux-musl -p oms_bridge
 
 # Stage 2: build the cosmos plugin gem
 FROM ruby:3-alpine AS gem-builder

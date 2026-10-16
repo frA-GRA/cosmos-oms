@@ -1,14 +1,14 @@
 [package]
 name = "oms_bridge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [[bin]]
 name = "oms_bridge"
 
 [dependencies]
-rcal = { version = "3", features = ["service"] }
-rcal_macros = { version = "3" }
+rcal = { version = "3", features = ["service", "dds"], path="../rcal/rcal" }
+rcal_macros = { version = "3", path="../rcal/rcal/rcal_macros" }
 tokio = { version = "1", features = ["full"] }
 slog = "2"
 slog-term = "2"

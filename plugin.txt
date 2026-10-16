@@ -1,5 +1,6 @@
 VARIABLE oms_bridge_binary oms_bridge
 VARIABLE oms_calconfig_path /config/CALConfig.toml
+VARIABLE oms_field_mappings_path /config/oms_field_mappings.toml
 VARIABLE oms_bridge_port 7780
 VARIABLE oms_zmq_peer ""
 
@@ -9,10 +10,11 @@ MICROSERVICE OMS_BRIDGE OMS_BRIDGE
   CMD ruby oms_bridge_microservice.rb
   ENV OMS_BRIDGE_BINARY <%= oms_bridge_binary %>
   ENV RCAL_CALCONFIG_PATH <%= oms_calconfig_path %>
+  ENV OMS_FIELD_MAPPINGS_PATH <%= oms_field_mappings_path %>
   ENV OMS_BRIDGE_PORT <%= oms_bridge_port %>
 <% unless oms_zmq_peer.to_s.strip.empty? %>
   ENV OMS_ZMQ_PEER <%= oms_zmq_peer %>
 <% end %>
 
-INTERFACE OMS_INT tcpip_client_interface.rb 127.0.0.1 <%= oms_bridge_port %> <%= oms_bridge_port %> nil 10.0 LENGTH 0 32 0 1 BIG_ENDIAN 4 nil nil
+INTERFACE OMS_INT tcpip_client_interface.rb 127.0.0.1 <%= oms_bridge_port %> <%= oms_bridge_port %> 10.0 10.0 LENGTH 0 32 4 1 BIG_ENDIAN nil nil nil
   MAP_TARGET OMS

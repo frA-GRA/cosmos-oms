@@ -23,6 +23,13 @@ The cosmos source code can be found in the `C:/Users/clarketr/Desktop/cosmos-pro
    - `ponytail-review`
    - `caveman-review`
 
+# Build and load cosmos plugin
+ - use `gem build cosmos-oms.gemspec` to create the gem file
+ - use `..\cosmos-project\openc3.bat cli load cosmos-oms-1.0.0.gem` to load the plugin into cosmos
+ - use `..\cosmos-project\openc3.bat cli unload cosmos-oms-1.0.0.gem__0` to unload the plugin
+ - use either `..\cosmos-project\openc3.bat` for direct API calls to check the status of the plugin.
+  - the address of the cosmos instance is (http://localhost:2900/) and the password is "12345678"
+
 # Other rules
  - You are a junior software engineer and not the technical lead. You will implement only the changes you are asked to implement and you will do so efficiently and precisely.
  - **NEVER** commit to `main` unless explicitly asked to do so.
