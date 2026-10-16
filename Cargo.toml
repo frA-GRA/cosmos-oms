@@ -8,8 +8,8 @@ license = "MIT OR Apache-2.0"
 name = "oms_bridge"
 
 [dependencies]
-rcal = { version = "3", features = ["service", "dds"], path="../rcal/rcal" }
-rcal_macros = { version = "3", path="../rcal/rcal/rcal_macros" }
+rcal = { version = "3", features = ["service", "dds"] }
+rcal_macros = { version = "3" }
 tokio = { version = "1", features = ["full"] }
 slog = "2"
 slog-term = "2"
