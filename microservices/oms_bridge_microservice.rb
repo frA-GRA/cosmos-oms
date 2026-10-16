@@ -3,7 +3,8 @@ require 'openc3/microservices/microservice'
 module OmsCosmosPlugin
   class OmsBridgeMicroservice < OpenC3::Microservice
     def run
-      binary = ENV.fetch('OMS_BRIDGE_BINARY', 'oms_bridge')
+      default = File.join(__dir__, 'bin', 'oms_bridge')
+      binary = ENV.fetch('OMS_BRIDGE_BINARY', '').then { |v| v.empty? ? default : v }
       loop do
         pid = spawn(ENV.to_h, binary)
         Process.wait(pid)

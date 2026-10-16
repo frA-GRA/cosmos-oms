@@ -75,6 +75,8 @@ struct Schema {
     simple_types: HashMap<String, Vec<String>>,
     /// Non-enum simpleType restriction bases: type name → base type local name.
     simple_type_bases: HashMap<String, String>,
+    /// complexType extension bases: type name → base type local name.
+    extension_bases: HashMap<String, String>,
 }
 
 struct FieldInfo {
@@ -94,6 +96,7 @@ fn parse_xsd(path: &PathBuf) -> Schema {
         complex_types: HashMap::new(),
         simple_types: HashMap::new(),
         simple_type_bases: HashMap::new(),
+        extension_bases: HashMap::new(),
     };
 
     let mut current_complex: Option<(String, Vec<FieldInfo>)> = None;
@@ -134,6 +137,12 @@ fn parse_xsd(path: &PathBuf) -> Schema {
                                 }
                                 current_simple_base = Some(base_local);
                             }
+                        }
+                    }
+                    "extension" => {
+                        if let (Some(ct), Some(base)) = (&current_complex, attr(e, "base")) {
+                            let base_local = local_part(&base);
+                            schema.extension_bases.insert(ct.0.clone(), base_local);
                         }
                     }
                     "enumeration" => {
@@ -536,6 +545,13 @@ enum FieldSpec {
         cosmos_name: String,
         accessor: String,
     },
+    /// Float field reached through one or more optional intermediate elements.
+    /// `opt_accessor` evaluates to `Option<f64>`.
+    OptFloat {
+        bits: u8,
+        cosmos_name: String,
+        opt_accessor: String,
+    },
     Bool {
         cosmos_name: String,
         accessor: String,
@@ -651,7 +667,7 @@ fn build_fields_from_config(
 ) -> Vec<FieldSpec> {
     let mut fields = Vec::new();
     for fm in &entry.fields {
-        let Some((xsd_type, accessor, min_occurs, max_occurs)) =
+        let Some((xsd_type, accessor, min_occurs, max_occurs, segs)) =
             resolve_field_path(&fm.path, mt_type, schema)
         else {
             println!(
@@ -660,16 +676,20 @@ fn build_fields_from_config(
             );
             continue;
         };
-        if min_occurs == 0 {
+        if max_occurs != 1 {
             println!(
-                "cargo:warning=OMS mapping: path '{}' is optional (minOccurs=0); skipping",
+                "cargo:warning=OMS mapping: path '{}' is repeated (maxOccurs!=1); skipping",
                 fm.path
             );
             continue;
         }
-        if max_occurs != 1 {
+
+        // Check whether any segment (including the leaf) is optional.
+        let has_opt = segs.iter().any(|(_, opt)| *opt);
+
+        if !has_opt && min_occurs == 0 {
             println!(
-                "cargo:warning=OMS mapping: path '{}' is repeated (maxOccurs!=1); skipping",
+                "cargo:warning=OMS mapping: path '{}' is optional (minOccurs=0); skipping",
                 fm.path
             );
             continue;
@@ -681,11 +701,23 @@ fn build_fields_from_config(
             .clone()
             .unwrap_or_else(|| to_upper_snake(leaf));
 
+        // For paths with optional intermediates, infer the base spec then convert Float → OptFloat.
         let spec = if let Some(ref type_str) = fm.type_override {
-            apply_type_override(type_str, cosmos_name, accessor, &xsd_type, schema)
+            let s = apply_type_override(type_str, cosmos_name.clone(), accessor, &xsd_type, schema);
+            if has_opt {
+                s.and_then(|s| opt_float_from_spec(s, &segs, &cosmos_name))
+            } else {
+                s
+            }
         } else {
             match infer_field_spec(&xsd_type, cosmos_name.clone(), accessor, schema) {
-                Some(s) => Some(s),
+                Some(s) => {
+                    if has_opt {
+                        opt_float_from_spec(s, &segs, &cosmos_name)
+                    } else {
+                        Some(s)
+                    }
+                }
                 None => {
                     println!(
                         "cargo:warning=OMS mapping: cannot auto-detect cosmos type for path '{}' \
@@ -704,13 +736,92 @@ fn build_fields_from_config(
     fields
 }
 
-/// Walk the XSD type graph following slash-separated path segments from the MT type root.
-/// Returns `(xsd_type_local, full_accessor_expr, min_occurs, max_occurs)` for the leaf field.
-fn resolve_field_path(
-    path: &str,
-    mt_type: &str,
-    schema: &Schema,
-) -> Option<(String, String, u32, u32)> {
+/// Convert a `Float` FieldSpec into `OptFloat` for paths with optional intermediates.
+/// Non-float specs through optional paths are unsupported and skipped with a warning.
+fn opt_float_from_spec(
+    spec: FieldSpec,
+    segs: &[(String, bool)],
+    cosmos_name: &str,
+) -> Option<FieldSpec> {
+    match spec {
+        FieldSpec::Float {
+            bits, cosmos_name, ..
+        } => {
+            let opt_accessor = build_opt_float_accessor(segs);
+            Some(FieldSpec::OptFloat {
+                bits,
+                cosmos_name,
+                opt_accessor,
+            })
+        }
+        _ => {
+            println!(
+                "cargo:warning=OMS mapping: field '{cosmos_name}' has optional intermediate \
+                 elements but is not a float type; skipping"
+            );
+            None
+        }
+    }
+}
+
+/// Find a field by name in `type_name`, following xs:extension bases when not found in own fields.
+fn find_field_in_type<'a>(
+    schema: &'a Schema,
+    type_name: &str,
+    field_name: &str,
+) -> Option<&'a FieldInfo> {
+    if let Some(fields) = schema.complex_types.get(type_name) {
+        if let Some(f) = fields.iter().find(|f| f.name == field_name) {
+            return Some(f);
+        }
+    }
+    // Follow extension base (one level; base types rarely chain deeply).
+    if let Some(base) = schema.extension_bases.get(type_name) {
+        let base = base.clone();
+        return find_field_in_type(schema, &base, field_name);
+    }
+    None
+}
+
+/// Build an `Option<f64>` accessor expression for a path where some segments are optional.
+/// `segs`: (snake_method_name, is_optional) per path segment, first entry called on `msg`.
+fn build_opt_float_accessor(segs: &[(String, bool)]) -> String {
+    fn rec(segs: &[(String, bool)], receiver: &str, var_idx: &mut usize) -> String {
+        match segs {
+            [] => format!("Some({receiver} as f64)"),
+            [(method, is_opt)] => {
+                let call = format!("{receiver}.{method}()");
+                if *is_opt {
+                    format!("{call}.map(|_v| *_v as f64)")
+                } else {
+                    format!("Some(*{call} as f64)")
+                }
+            }
+            [(method, is_opt), rest @ ..] => {
+                let call = format!("{receiver}.{method}()");
+                if *is_opt {
+                    let var = format!("_v{}", *var_idx);
+                    *var_idx += 1;
+                    let inner = rec(rest, &var, var_idx);
+                    format!("{call}.and_then(|{var}| {inner})")
+                } else {
+                    rec(rest, &call, var_idx)
+                }
+            }
+        }
+    }
+    if segs.is_empty() {
+        return "None".to_string();
+    }
+    let mut idx = 0usize;
+    rec(segs, "msg", &mut idx)
+}
+
+/// `(xsd_type_local, accessor_expr, min_occurs, max_occurs, segs)` for a resolved path.
+/// `segs` is `(snake_method_name, is_optional)` per segment.
+type ResolvedField = Option<(String, String, u32, u32, Vec<(String, bool)>)>;
+
+fn resolve_field_path(path: &str, mt_type: &str, schema: &Schema) -> ResolvedField {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return None;
@@ -721,13 +832,15 @@ fn resolve_field_path(
     let mut leaf_xsd_type = String::new();
     let mut min_occurs = 1u32;
     let mut max_occurs = 1u32;
+    let mut segs: Vec<(String, bool)> = Vec::new();
 
     for seg in &segments {
-        let fields = schema.complex_types.get(&current_type)?;
-        let field = fields.iter().find(|f| f.name.as_str() == *seg)?;
+        let field = find_field_in_type(schema, &current_type, seg)?;
+        let method = snake(&field.name);
         accessor.push('.');
-        accessor.push_str(&snake(&field.name));
+        accessor.push_str(&method);
         accessor.push_str("()");
+        segs.push((method, field.min_occurs == 0));
         leaf_xsd_type = field.type_local.clone();
         min_occurs = field.min_occurs;
         max_occurs = field.max_occurs;
@@ -737,7 +850,7 @@ fn resolve_field_path(
     if leaf_xsd_type.is_empty() {
         return None;
     }
-    Some((leaf_xsd_type, accessor, min_occurs, max_occurs))
+    Some((leaf_xsd_type, accessor, min_occurs, max_occurs, segs))
 }
 
 /// Auto-detect a `FieldSpec` from an XSD type local name, resolving through simpleType bases.
@@ -970,7 +1083,11 @@ fn generate_cosmos_config(specs: &[MessageSpec]) {
             spec.msg_name
         )
         .unwrap();
-        writeln!(out, "  APPEND_ITEM FRAME_LEN 32 UINT \"Frame length (protocol header)\"").unwrap();
+        writeln!(
+            out,
+            "  APPEND_ITEM FRAME_LEN 32 UINT \"Frame length (protocol header)\""
+        )
+        .unwrap();
         writeln!(
             out,
             "  APPEND_ID_ITEM PACKET_ID 16 UINT {} \"Packet type identifier\"",
@@ -1024,6 +1141,11 @@ fn generate_cosmos_config(specs: &[MessageSpec]) {
                     writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} INT \"\"").unwrap();
                 }
                 FieldSpec::Float {
+                    bits, cosmos_name, ..
+                } => {
+                    writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} FLOAT \"\"").unwrap();
+                }
+                FieldSpec::OptFloat {
                     bits, cosmos_name, ..
                 } => {
                     writeln!(out, "  APPEND_ITEM {cosmos_name} {bits} FLOAT \"\"").unwrap();
@@ -1361,6 +1483,23 @@ fn emit_field_encode(out: &mut String, field: &FieldSpec) {
             )
             .unwrap();
             writeln!(out, "        fields.extend_from_slice(&s_buf);").unwrap();
+            writeln!(out, "    }}").unwrap();
+        }
+        FieldSpec::OptFloat {
+            bits, opt_accessor, ..
+        } => {
+            let cast = if *bits == 32 { "f32" } else { "f64" };
+            writeln!(out, "    {{").unwrap();
+            writeln!(
+                out,
+                "        let _opt: Option<{cast}> = ({opt_accessor}).map(|v| v as {cast});"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        fields.extend_from_slice(&_opt.unwrap_or({cast}::NAN).to_be_bytes());"
+            )
+            .unwrap();
             writeln!(out, "    }}").unwrap();
         }
         FieldSpec::TimestampMs { accessor, .. } => {

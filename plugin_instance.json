@@ -1,14 +1,14 @@
 {
-  "name": "cosmos-oms-1.0.0.gem",
+  "name": "cosmos-oms-1.0.6.gem",
   "variables": {
-    "oms_bridge_binary": "/usr/local/bin/oms_bridge",
+    "oms_bridge_binary": "",
     "oms_calconfig_path": "/config/CALConfig.toml",
     "oms_field_mappings_path": "/config/oms_field_mappings.toml",
     "oms_bridge_port": "7780",
     "oms_zmq_peer": ""
   },
   "plugin_txt_lines": [
-    "VARIABLE oms_bridge_binary oms_bridge",
+    "VARIABLE oms_bridge_binary \"\"",
     "VARIABLE oms_calconfig_path /config/CALConfig.toml",
     "VARIABLE oms_field_mappings_path /config/oms_field_mappings.toml",
     "VARIABLE oms_bridge_port 7780",
@@ -18,7 +18,9 @@
     "",
     "MICROSERVICE OMS_BRIDGE OMS_BRIDGE",
     "  CMD ruby oms_bridge_microservice.rb",
+    "<% unless oms_bridge_binary.to_s.strip.empty? %>",
     "  ENV OMS_BRIDGE_BINARY <%= oms_bridge_binary %>",
+    "<% end %>",
     "  ENV RCAL_CALCONFIG_PATH <%= oms_calconfig_path %>",
     "  ENV OMS_FIELD_MAPPINGS_PATH <%= oms_field_mappings_path %>",
     "  ENV OMS_BRIDGE_PORT <%= oms_bridge_port %>",
@@ -26,7 +28,7 @@
     "  ENV OMS_ZMQ_PEER <%= oms_zmq_peer %>",
     "<% end %>",
     "",
-    "INTERFACE OMS_INT tcpip_client_interface.rb 127.0.0.1 <%= oms_bridge_port %> <%= oms_bridge_port %> 10.0 10.0 LENGTH 0 32 4 1 BIG_ENDIAN 4 nil nil",
+    "INTERFACE OMS_INT tcpip_client_interface.rb 127.0.0.1 <%= oms_bridge_port %> <%= oms_bridge_port %> 10.0 10.0 LENGTH 0 32 4 1 BIG_ENDIAN nil nil nil",
     "  MAP_TARGET OMS"
   ]
 }

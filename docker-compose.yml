@@ -19,7 +19,8 @@ services:
         WORKDIR /build
         COPY . .
         WORKDIR /build/adsb_sim
-        RUN cargo build --release --bin adsb_sim
+        RUN sed -i 's|rcal = { path = "../rcal" }|rcal = { path = "../rcal", features = ["service", "dds"] }|' Cargo.toml \
+         && cargo build --release --bin adsb_sim
 
         FROM debian:bookworm-slim
         WORKDIR /app
@@ -31,7 +32,6 @@ services:
     volumes:
       - ./config/CALConfig.adsb_sim.toml:/app/CALConfig.toml:ro
     networks:
-      - default
       - cosmos-project_default
 
   asb-dump:

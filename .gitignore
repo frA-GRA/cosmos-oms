@@ -12,3 +12,4 @@ vendor/
 targets/
 *.stackdump
 cosmos-oms-*.gem
+microservices/OMS_BRIDGE/bin

@@ -1,4 +1,4 @@
-VARIABLE oms_bridge_binary oms_bridge
+VARIABLE oms_bridge_binary ""
 VARIABLE oms_calconfig_path /config/CALConfig.toml
 VARIABLE oms_field_mappings_path /config/oms_field_mappings.toml
 VARIABLE oms_bridge_port 7780
@@ -8,7 +8,9 @@ TARGET OMS OMS
 
 MICROSERVICE OMS_BRIDGE OMS_BRIDGE
   CMD ruby oms_bridge_microservice.rb
+<% unless oms_bridge_binary.to_s.strip.empty? %>
   ENV OMS_BRIDGE_BINARY <%= oms_bridge_binary %>
+<% end %>
   ENV RCAL_CALCONFIG_PATH <%= oms_calconfig_path %>
   ENV OMS_FIELD_MAPPINGS_PATH <%= oms_field_mappings_path %>
   ENV OMS_BRIDGE_PORT <%= oms_bridge_port %>
