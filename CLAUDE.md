@@ -16,7 +16,7 @@ The cosmos source code can be found in the `C:/Users/clarketr/Desktop/cosmos-pro
 
 # Coding review and checks
  - After implementing a new feature run the following tools.
-   - `cargo check --worspace --all-targets`
+   - `cargo check --workspace --all-targets`
    - `cargo clippy --no-deps`
    - `cargo fmt --all`
    - `cargo test --workspace --all-targets`
